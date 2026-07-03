@@ -1,30 +1,94 @@
 # run_digi_reco.py
 # steering file for the ALLEGRO digitization/reconstruction
 
-#
+#------------------------------------------------------------------------------------------------
 # COMMON IMPORTS
-#
+#------------------------------------------------------------------------------------------------
 
 # Logger
 from Gaudi.Configuration import INFO, DEBUG, VERBOSE, ERROR
 # units and physical constants
 from GaudiKernel.PhysicalConstants import pi
 
+#------------------------------------------------------------------------------------------------
+# utility functions to extract constants from compact files
+#------------------------------------------------------------------------------------------------
+
+import os
+import xml.etree.ElementTree as ET
+from collections import defaultdict
+
+def _resolve_path(base, ref):
+    return os.path.abspath(os.path.join(os.path.dirname(base), ref))
+
+def extract_all_constants(xml_path, visited=None, constants=None):
+    """
+    Recursively extract ALL DD4hep constants from a main XML + includes.
+    Returns dict: {constant_name: value}
+    """
+
+    if visited is None:
+        visited = set()
+
+    if constants is None:
+        constants = {}
+
+    xml_path = os.path.abspath(xml_path)
+
+    if xml_path in visited:
+        return constants
+    visited.add(xml_path)
+    tree = ET.parse(xml_path)
+    root = tree.getroot()
+
+    # 1. collect constants
+    for c in root.findall(".//constant"):
+        name = c.get("name")
+        value = c.get("value")
+        if name and value is not None:
+            # keep first occurrence (DD4hep override-safe behaviour)
+            if name not in constants:
+                constants[name] = value
+
+    # 2. recurse into includes
+    for inc in root.findall(".//include"):
+        ref = inc.get("ref")
+        if not ref:
+            continue
+        inc_path = _resolve_path(xml_path, ref)
+        if os.path.exists(inc_path):
+            extract_all_constants(inc_path, visited, constants)
+
+    return constants
+
+#------------------------------------------------------------------------------------------------
+# detector to run and associated constants
+#------------------------------------------------------------------------------------------------
+path_to_detector = os.environ.get("K4GEO", "") + "/FCCee/ALLEGRO/compact/ALLEGRO_o1_v03/"  # folder containing the compact files.
+                                                                                           # if K4GEO is empty, this should use relative path to working directory
+detectors_to_use = [ 'ALLEGRO_o1_v03.xml' ]  # compact file(s) of detectors
+
+constants = {}
+for detector in detectors_to_use:
+    fullpath = path_to_detector + detector
+    constants.update(extract_all_constants(fullpath))
+print(constants)
+
+#------------------------------------------------------------------------------------------------
+# settings for digitisation and reconstruction
+#------------------------------------------------------------------------------------------------
+
 #
-# SETTINGS
+# 1. default settings, that can be overridden via CLI
 #
+inputfile = "ALLEGRO_sim.root"                              # input file produced with ddsim - can be overridden with IOSvc.Input
+outputfile = "ALLEGRO_sim_digi_reco.root"                   # output file produced by this steering file - can be overridden with IOSvc.Output
+Nevts = -1                                                  # events to process: -1 means all events in input file (can be overridden with -n or --num-events option of k4run)
+dataFolderDef = "./"                                        # default value of the directory containing the calibration files
 
-# - default settings, that can be overridden via CLI
-inputfile = "ALLEGRO_sim.root"             # input file produced with ddsim - can be overridden with IOSvc.Input
-outputfile = "ALLEGRO_sim_digi_reco.root"  # output file produced by this steering file - can be overridden with IOSvc.Output
-Nevts = -1                                 # -1 means all events in input file (can be overridden with -n or --num-events option of k4run
-dataFolderDef = "./"                       # directory containing the calibration files
-
-# - general settings not set via CLI
-filterNoiseThreshold = -1                  # if addNoise is true, and filterNoiseThreshold is >0, will filter away cells with abs(energy) below filterNoiseThreshold * expected sigma(noise)
-# filterNoiseThreshold = 2                 # if addNoise is true, and filterNoiseThreshold is >0, will filter away cells with abs(energy) below filterNoiseThreshold * expected sigma(noise)
-
-# - general settings set via CLI
+#
+# 2. general settings set via CLI
+#
 from k4FWCore.parseArgs import parser
 def str2bool(v):
     if isinstance(v, bool):
@@ -44,7 +108,7 @@ parser.add_argument("--saveCells", type=str2bool, nargs="?", help="Save cell col
 parser.add_argument("--keepUncalibratedCells", type=str2bool, nargs="?", help="Save uncalibrated cell collections", const=True, default=False)
 parser.add_argument("--addNoise", type=str2bool, nargs="?", help="Add noise to cells (ECAL barrel only)", const=True, default=False)
 parser.add_argument("--addCrosstalk", type=str2bool, nargs="?", help="Add cross-talk to cells (ECAL barrel only)", const=True, default=False)
-parser.add_argument("--addTracks", type=str2bool, nargs="?", help="Add reco-level tracks (smeared truth tracks)", const=True, default=False)
+parser.add_argument("--addTruthTracks", type=str2bool, nargs="?", help="Add reco-level tracks (smeared truth tracks)", const=True, default=False)
 parser.add_argument("--doSWClustering", type=str2bool, nargs="?", help="Enable or disable sliding window clustering", const=True, default=True)
 parser.add_argument("--createClusterCellCollections", type=str2bool, nargs="?", help="Create new cluster cell collections or just link clusters to cells in standard cell collections", const=True, default=True)
 parser.add_argument("--doTopoClustering", type=str2bool, nargs="?", help="Enable or disable topo clustering", const=True, default=True)
@@ -57,32 +121,91 @@ parser.add_argument("--runTrkFinder", type=str2bool, nargs="?", help="Run Geomet
 parser.add_argument("--runTrkFitter", type=str2bool, nargs="?", help="Run track fitter on tracks", const=True, default=False)
 
 opts = parser.parse_known_args()[0]
-dataFolder = opts.dataFolder                        # directory containing the calibration files
-runHCal = opts.includeHCal                          # if false, it will produce only ECAL clusters. if true, it will also produce ECAL+HCAL clusters
-runMuon = opts.includeMuon                          # if false, it will not digitize muon hits
-addNoise = opts.addNoise                            # add noise or not to the cell energy
-addCrosstalk = opts.addCrosstalk                    # switch on/off the crosstalk
-addTracks = opts.addTracks                          # add tracks or not
-runTrkHitDigitization = opts.runTrkHitDigitization  # digitize tracker hits (DDPlanarDigi as default)
-useLegacyVTXDigitizer = opts.useLegacyVTXDigitizer  # digitize tracker hits (VTXdigitizer, smear truth)
-runTrkFinder = opts.runTrkFinder                    # run GGTF on digitized tracker hits
-runTrkFitter = opts.runTrkFitter                    # run track fitter on tracks
+dataFolder = opts.dataFolder                                # directory containing the calibration files
+runHCal = opts.includeHCal                                  # if false, it will produce only ECAL clusters. if true, it will also produce ECAL+HCAL clusters
+runMuon = opts.includeMuon                                  # if false, it will not digitize muon hits and not produce muon clusers
+addNoise = opts.addNoise                                    # add noise in calorimeters
+addCrosstalk = opts.addCrosstalk                            # switch on the crosstalk
+addTruthTracks = opts.addTruthTracks                        # add tracks (from true chargerd particles)
+runTrkHitDigitization = opts.runTrkHitDigitization          # digitize tracker hits (DDPlanarDigi as default)
+useLegacyVTXDigitizer = opts.useLegacyVTXDigitizer          # digitize tracker hits (VTXdigitizer, smear truth)
+runTrkFinder = opts.runTrkFinder                            # run GGTF on digitized tracker hits
+runTrkFitter = opts.runTrkFitter                            # run track fitter on tracks
+doSWClustering = opts.doSWClustering                        # create SW clusters
+doTopoClustering = opts.doTopoClustering                    # create topo clusters
+applyMVAClusterEnergyCalibration = opts.calibrateClusters   # BDT regression for cluster energy (ECAL only so far)
+addPi0RecoTool = opts.reconstructPi0s                       # resolved pi0 reconstruction by cluster pairing
+runPhotonIDTool = opts.runPhotonID                          # run photon-ID BDT (ECAL barrel only)
 
-# - what to save in output file
+dropUncalibratedCells = not opts.keepUncalibratedCells      # drop uncalibrated cells from output (true by default)
+saveHits = opts.saveHits                                    # save G4 hits in calorimeters in output (false by default)
+saveCells = opts.saveCells                                  # save digitised cells in calorimeters in outpu (false by default).
+                                                            # Note: cluster cells are not needed for the training of the MVA
+                                                            # energy regression nor the photon ID since needed quantities are stored in cluster shapeParameters
+saveClusterCells = opts.createClusterCellCollections        # save a new collection of clustered cells in output (if not, cluster links to cells point to the original collections)
+
 #
-# by default drop uncalibrated cells, but can keep for tests and debugging
-dropUncalibratedCells = not opts.keepUncalibratedCells
+# 3. general settings not set via CLI
+#
 
-# for big productions, save significant space removing hits and cells
-# however, hits and cluster cells might be wanted for small productions for detailed event displays
-# cluster cells are not needed for the training of the MVA energy regression nor the photon ID since needed quantities are stored in cluster shapeParameters
-saveHits = opts.saveHits
-saveCells = opts.saveCells
-# only save cluster cells if the user creates these collections
-saveClusterCells = opts.createClusterCellCollections
+# for calorimeter digitisation
+filterNoiseThreshold = -1                                   # if addNoise is true, but filterNoiseThreshold is <0, all cells are kept
+# filterNoiseThreshold = 2                                  # if addNoise is true, and filterNoiseThreshold is >0, will remove cells with abs(energy)< filterNoiseThreshold * expected sigma(noise)
+applyUpDownstreamCorrections = False                        # simple parametrisations of up/downstream losses for ECAL-only clusters - superseded by MVA calibration
+addShapeParameters = True                                   # calculate cluster energy and barycenter per layer and save it as extra parameters
+ecalBarrelThetaWeights = [-1, 3.0, 3.0, 3.0, 4.25, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]  # weights for calculation of ECAL barrel centroids with log(E) weighting (if w<0: use E-weighting)
+# ecalBarrelThetaWeights = [-1]*11
+logEWeightInPhotonID = False                                # use E or log(E) weights to calculate shower shapes for photon-ID
 
+# - ECAL readouts
+ecalBarrelReadoutName = "ECalBarrelModuleThetaMerged"       # barrel, original segmentation (baseline)
+ecalBarrelReadoutName2 = "ECalBarrelModuleThetaMerged2"     # barrel, after re-segmentation (for optimisation studies)
+ecalEndcapReadoutName = "ECalEndcapTurbine"                 # endcap, turbine-like (baseline)
+
+# - HCAL readouts
+if runHCal:
+    hcalBarrelReadoutName = "HCalBarrelReadout"             # barrel, original segmentation (phi-theta)
+    # hcalBarrelReadoutName = "HCalBarrelReadoutPhiRow"     # barrel, alternative segmentation (phi-row)
+    hcalEndcapReadoutName = "HCalEndcapReadout"             # endcap, original segmentation
+else:
+    hcalBarrelReadoutName = ""
+    hcalEndcapReadoutName = ""
+
+resegmentECalBarrel = False
+    
+# - ECAL barrel sampling fractions
+#
+# e-, 10 GeV, flat theta, B field off
+# ecalBarrelSamplingFraction = [0.3800493723322256] * 1 + [0.13494147915064658] * 1 + [0.142866851721152] * 1 + [0.14839315921940666] * 1 + [0.15298362570665006] * 1 + [0.15709704561942747] * 1 + [0.16063717490147533] * 1 + [0.1641723795419055] * 1 + [0.16845490287689746] * 1 + [0.17111520115997653] * 1 + [0.1730605163148862] * 1
+# e-, 20 GeV, flat theta, B field on
+# LAr+Pb
+ecalBarrelSamplingFraction = [0.3790943904011486] * 1 + [0.1355600584387894] * 1 + [0.14628210607758893] * 1 + [0.15274136994224854] * 1 + [0.15817255837886351] * 1 + [0.16290355087527258] * 1 + [0.1674201708055751] * 1 + [0.1715846423182708] * 1 + [0.17558662106635545] * 1 + [0.18002243792463576] * 1 + [0.18288329976007917] * 1
+# LKr+W
+# ecalBarrelSamplingFraction = [0.4806159038189229, 0.2822724529941907, 0.29324811578621524, 0.2996356722403102, 0.3047116566166906, 0.3090324459212472, 0.3133282052725273, 0.3173868504112048, 0.3215311396527887, 0.32516920330802673, 0.3318488881234955]
+
+# - ECAL barrel upstream/downstream corrections
+ecalBarrelUpstreamParameters = [[0.028158491043365624, -1.564259408365951, -76.52312805346982, 0.7442903558010191, -34.894692961350195, -74.19340877431723]]
+ecalBarrelDownstreamParameters = [[0.00010587711361028165, 0.0052371999097777355, 0.69906696456064, -0.9348243433360095, -0.0364714212117143, 8.360401126995626]]
+
+# - ECAL endcap sampling fractions
+#
+# NB some cells near the inner and outer edges of the calorimeter are difficult
+# to calibrate as they are not part of the core of well-contained showers.
+# The calibrated values can be <0 or >1 for such cells, so these nonsenical
+# numbers are replaced by 1
+ecalEndcapSamplingFraction = [0.0897818] * 1+ [0.221318] * 1+ [0.0820002] * 1+ [0.994281] * 1+ [0.0414437] * 1+ [0.1148] * 1+ [0.178831] * 1+ [0.142449] * 1+ [0.181206] * 1+ [0.342843] * 1+ [0.137479] * 1+ [0.176479] * 1+ [0.153273] * 1+ [0.195836] * 1+ [0.0780405] * 1+ [0.150202] * 1+ [0.17846] * 1+ [0.164886] * 1+ [0.175758] * 1+ [0.10836] * 1+ [0.160243] * 1+ [0.183373] * 1+ [0.171818] * 1+ [0.194848] * 1+ [0.111899] * 1+ [0.170704] * 1+ [0.188455] * 1+ [0.178164] * 1+ [0.209113] * 1+ [0.105241] * 1+ [0.180637] * 1+ [0.192206] * 1+ [0.186096] * 1+ [0.211962] * 1+ [0.112019] * 1+ [0.180344] * 1+ [0.195684] * 1+ [0.190778] * 1+ [0.218259] * 1+ [0.118516] * 1+ [0.207786] * 1+ [0.204474] * 1+ [0.207048] * 1+ [0.225913] * 1+ [0.111325] * 1+ [0.147875] * 1+ [0.195625] * 1+ [0.173326] * 1+ [0.175449] * 1+ [0.104087] * 1+ [0.153645] * 1+ [0.161263] * 1+ [0.165499] * 1+ [0.171758] * 1+ [0.175789] * 1+ [0.180657] * 1+ [0.184563] * 1+ [0.187876] * 1+ [0.191762] * 1+ [0.19426] * 1+ [0.197959] * 1+ [0.199021] * 1+ [0.204428] * 1+ [0.195709] * 1+ [0.151751] * 1+ [0.171477] * 1+ [0.165509] * 1+ [0.172565] * 1+ [0.172961] * 1+ [0.175534] * 1+ [0.177989] * 1+ [0.18026] * 1+ [0.181898] * 1+ [0.183912] * 1+ [0.185654] * 1+ [0.187515] * 1+ [0.190408] * 1+ [0.188794] * 1+ [0.193699] * 1+ [0.192287] * 1+ [0.19755] * 1+ [0.190943] * 1+ [0.218553] * 1+ [0.161085] * 1+ [0.373086] * 1+ [0.122495] * 1+ [0.21103] * 1+ [1] * 1+ [0.138686] * 1+ [0.0545171] * 1+ [1] * 1+ [1] * 1+ [0.227945] * 1+ [0.0122872] * 1+ [0.00437334] * 1+ [0.00363533] * 1+ [1] * 1+ [1] * 1
+
+# - HCAL barrel/endcap inverse sampling fractions
+hcalInverseSamplingFraction = 29.4202
+
+# - expected noise histograms (if noise is added to the cells during digitisation)
+ecalBarrelNoisePath = dataFolder + "elecNoise_ecalBarrelFCCee_theta.root"
+ecalBarrelNoiseRMSHistName = "h_elecNoise_fcc_"
+ecalEndcapNoisePath = dataFolder + "elecNoise_ecalendcap.root"
+ecalEndcapNoiseRMSHistName = "noise_endcap_wheel"
+
+# for output
 dropLumiCalHits = True
-
 # for tracker hits there is a single hit/readout cell so not much gain by dropping them, especially if the corresponding digitized cells (smeared hits) have not been added to output
 # dropVertexHits = True
 # dropDCHHits = True
@@ -94,87 +217,16 @@ dropSiWrHits = False
 dropMuonHits = False
 
 
-# ECAL barrel parameters for digitization
-# TODO: extract number of layers (for ECAL and HCAL) directly from the detector segmentations
-ecalBarrelLayers = 11
-# e-, 10 GeV, flat theta, B field off
-# ecalBarrelSamplingFraction = [0.3800493723322256] * 1 + [0.13494147915064658] * 1 + [0.142866851721152] * 1 + [0.14839315921940666] * 1 + [0.15298362570665006] * 1 + [0.15709704561942747] * 1 + [0.16063717490147533] * 1 + [0.1641723795419055] * 1 + [0.16845490287689746] * 1 + [0.17111520115997653] * 1 + [0.1730605163148862] * 1
-# e-, 20 GeV, flat theta, B field on
-# LAr+Pb
-ecalBarrelSamplingFraction = [0.3790943904011486] * 1 + [0.1355600584387894] * 1 + [0.14628210607758893] * 1 + [0.15274136994224854] * 1 + [0.15817255837886351] * 1 + [0.16290355087527258] * 1 + [0.1674201708055751] * 1 + [0.1715846423182708] * 1 + [0.17558662106635545] * 1 + [0.18002243792463576] * 1 + [0.18288329976007917] * 1
-# LKr+W
-# ecalBarrelSamplingFraction = [0.4806159038189229, 0.2822724529941907, 0.29324811578621524, 0.2996356722403102, 0.3047116566166906, 0.3090324459212472, 0.3133282052725273, 0.3173868504112048, 0.3215311396527887, 0.32516920330802673, 0.3318488881234955]
-
-ecalBarrelUpstreamParameters = [[0.028158491043365624, -1.564259408365951, -76.52312805346982, 0.7442903558010191, -34.894692961350195, -74.19340877431723]]
-ecalBarrelDownstreamParameters = [[0.00010587711361028165, 0.0052371999097777355, 0.69906696456064, -0.9348243433360095, -0.0364714212117143, 8.360401126995626]]
-if ecalBarrelSamplingFraction and len(ecalBarrelSamplingFraction) > 0:
-    assert (ecalBarrelLayers == len(ecalBarrelSamplingFraction))
-# ECAL endcap parameters for digitization
-# the turbine endcap has calibration "layers" in the both the z and radial
-# directions, for each of the three wheels.  So the total number of layers
-# is given by:
-#
-#   ECalEndcapNumCalibZLayersWheel1*ECalEndcapNumCalibRhoLayersWheel1
-#  +ECalEndcapNumCalibZLayersWheel2*ECalEndcapNumCalibRhoLayersWheel2
-#  +ECalEndcapNumCalibZLayersWheel3*ECalEndcapNumCalibRhoLayersWheel3
-#
-# which in the current design is 5*10+1*14+1*34 = 98
-# NB some cells near the inner and outer edges of the calorimeter are difficult
-# to calibrate as they are not part of the core of well-contained showers.
-# The calibrated values can be <0 or >1 for such cells, so these nonsenical
-# numbers are replaced by 1
-ecalEndcapLayers = 98
-ecalEndcapSamplingFraction = [0.0897818] * 1+ [0.221318] * 1+ [0.0820002] * 1+ [0.994281] * 1+ [0.0414437] * 1+ [0.1148] * 1+ [0.178831] * 1+ [0.142449] * 1+ [0.181206] * 1+ [0.342843] * 1+ [0.137479] * 1+ [0.176479] * 1+ [0.153273] * 1+ [0.195836] * 1+ [0.0780405] * 1+ [0.150202] * 1+ [0.17846] * 1+ [0.164886] * 1+ [0.175758] * 1+ [0.10836] * 1+ [0.160243] * 1+ [0.183373] * 1+ [0.171818] * 1+ [0.194848] * 1+ [0.111899] * 1+ [0.170704] * 1+ [0.188455] * 1+ [0.178164] * 1+ [0.209113] * 1+ [0.105241] * 1+ [0.180637] * 1+ [0.192206] * 1+ [0.186096] * 1+ [0.211962] * 1+ [0.112019] * 1+ [0.180344] * 1+ [0.195684] * 1+ [0.190778] * 1+ [0.218259] * 1+ [0.118516] * 1+ [0.207786] * 1+ [0.204474] * 1+ [0.207048] * 1+ [0.225913] * 1+ [0.111325] * 1+ [0.147875] * 1+ [0.195625] * 1+ [0.173326] * 1+ [0.175449] * 1+ [0.104087] * 1+ [0.153645] * 1+ [0.161263] * 1+ [0.165499] * 1+ [0.171758] * 1+ [0.175789] * 1+ [0.180657] * 1+ [0.184563] * 1+ [0.187876] * 1+ [0.191762] * 1+ [0.19426] * 1+ [0.197959] * 1+ [0.199021] * 1+ [0.204428] * 1+ [0.195709] * 1+ [0.151751] * 1+ [0.171477] * 1+ [0.165509] * 1+ [0.172565] * 1+ [0.172961] * 1+ [0.175534] * 1+ [0.177989] * 1+ [0.18026] * 1+ [0.181898] * 1+ [0.183912] * 1+ [0.185654] * 1+ [0.187515] * 1+ [0.190408] * 1+ [0.188794] * 1+ [0.193699] * 1+ [0.192287] * 1+ [0.19755] * 1+ [0.190943] * 1+ [0.218553] * 1+ [0.161085] * 1+ [0.373086] * 1+ [0.122495] * 1+ [0.21103] * 1+ [1] * 1+ [0.138686] * 1+ [0.0545171] * 1+ [1] * 1+ [1] * 1+ [0.227945] * 1+ [0.0122872] * 1+ [0.00437334] * 1+ [0.00363533] * 1+ [1] * 1+ [1] * 1
-if ecalEndcapSamplingFraction and len(ecalEndcapSamplingFraction) > 0:
-    assert (ecalEndcapLayers == len(ecalEndcapSamplingFraction))
-
-resegmentECalBarrel = False
-
-ecalEndcapWheels = 3
-hcalBarrelLayers = 13
-hcalEndcapLayers = 22
-
-# - parameters for clustering (could also be made configurable via CLI)
-doSWClustering = opts.doSWClustering
-doTopoClustering = opts.doTopoClustering
-doCreateClusterCellCollection = opts.createClusterCellCollections  # create new collection with clustered cells or just link from cluster to original input cell collections
-                                                                   # this applies to both SW and Topo cluster cell collections
-outputSaveClusters = []  # list of clusters for which we want to create the truth links
-
-# cluster energy corrections
-# simple parametrisations of up/downstream losses for ECAL-only clusters
-# not to be applied for ECAL+HCAL clustering
-# superseded by MVA calibration, but can be turned on here for the purpose of testing that the code is not broken - will end up in separate cluster collection
-applyUpDownstreamCorrections = False
-
-# BDT regression from total cluster energy and fraction of energy in each layer (after correction for sampling fraction)
-# not to be applied (yet) for ECAL+HCAL clustering (MVA trained only on ECAL so far)
-# applyMVAClusterEnergyCalibration = True
-applyMVAClusterEnergyCalibration = opts.calibrateClusters
-
-# calculate cluster energy and barycenter per layer and save it as extra parameters
-addShapeParameters = True
-ecalBarrelThetaWeights = [-1, 3.0, 3.0, 3.0, 4.25, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0]  # to be recalculated for V03, separately for topo and calo clusters...
-# ecalBarrelThetaWeights = [-1]*11
-
-# run photon ID algorithm
-# not run by default in production, but to be turned on here for the purpose of testing that the code is not broken
-# currently off till we provide the onnx files
-# runPhotonIDTool = False
-runPhotonIDTool = opts.runPhotonID
-logEWeightInPhotonID = False
-
-# resolved pi0 reconstruction by cluster pairing
-addPi0RecoTool = opts.reconstructPi0s
-
-#
+#------------------------------------------------------------------------------------------------
 # ALGORITHMS AND SERVICES SETUP
-#
+#------------------------------------------------------------------------------------------------
+
 TopAlg = []  # alg sequence
 ExtSvc = []  # list of external services
 
-
+#
 # Event counter
+#
 from Configurables import EventCounter
 eventCounter = EventCounter("EventCounter",
                             OutputLevel=INFO,
@@ -183,34 +235,32 @@ TopAlg += [eventCounter]
 # add a message sink service if you want a summary table at the end (not needed..)
 # ExtSvc += ["Gaudi::Monitoring::MessageSvcSink"]
 
+#
 # CPU information
+#
 from Configurables import AuditorSvc, ChronoAuditor
 chra = ChronoAuditor()
 audsvc = AuditorSvc()
 audsvc.Auditors = [chra]
 ExtSvc += [audsvc]
 
-
+#
 # Detector geometry
-# prefix all xmls with path_to_detector
-# if K4GEO is empty, this should use relative path to working directory
+#
 from Configurables import GeoSvc
 import os
 geoservice = GeoSvc("GeoSvc",
                     OutputLevel=INFO
                     # OutputLevel=DEBUG  # set to DEBUG to print dd4hep::DEBUG messages in k4geo C++ drivers
                     )
-
-path_to_detector = os.environ.get("K4GEO", "") + "/FCCee/ALLEGRO/compact/ALLEGRO_o1_v03/"
-detectors_to_use = [
-    'ALLEGRO_o1_v03.xml'
-]
 geoservice.detectors = [
     os.path.join(path_to_detector, _det) for _det in detectors_to_use
 ]
 ExtSvc += [geoservice]
 
+#
 # retrieve subdetector IDs
+#
 import xml.etree.ElementTree as ET
 tree = ET.parse(path_to_detector + 'DectDimensions.xml')
 root = tree.getroot()
@@ -231,11 +281,12 @@ for constant in root.find('define').findall('constant'):
         IDs[constant.get("name")[6:]] = int(constant.get('value'))
     if (constant.get('name') == 'DetID_Muon_Endcap_1'):
         IDs[constant.get("name")[6:-2]] = int(constant.get('value'))
-# debug
 print("Subdetector IDs:")
 print(IDs)
 
+#
 # Input/Output handling
+#
 from k4FWCore import IOSvc
 from Configurables import EventDataSvc
 io_svc = IOSvc("IOSvc")
@@ -243,13 +294,20 @@ io_svc.Input = inputfile
 io_svc.Output = outputfile
 ExtSvc += [EventDataSvc("EventDataSvc")]
 
-if addTracks or runTrkHitDigitization or addNoise:
+#
+# Random number generator
+#
+if addTruthTracks or runTrkHitDigitization or addNoise:
     ExtSvc += ["RndmGenSvc"]
 
+#
+# Tracking sequence
+#
 
-# Tracking
-# Create tracks from gen particles
-if addTracks:
+#
+# 1. Create tracks from gen particles
+#
+if addTruthTracks:
     from Configurables import TracksFromGenParticles
     tracksFromGenParticles = TracksFromGenParticles("CreateTracksFromGenParticles",
                                                     InputGenParticles=["MCParticles"],
@@ -283,8 +341,9 @@ if addTracks:
                                            OutputLevel=ERROR)
     TopAlg += [dNdxFromTracks]
 
-
-# Tracker digitization
+#
+# 2. Tracker digitization
+#
 if runTrkHitDigitization:
     import math
     # different sensors for inner/outer barrel layers
@@ -468,6 +527,9 @@ if runTrkHitDigitization:
     )
     TopAlg += [dch_digitizer]
 
+#
+# 3. track finding
+#
 if runTrkFinder:
     # Run consistency checks first
     if not runTrkHitDigitization:
@@ -497,6 +559,9 @@ if runTrkFinder:
     )
     TopAlg += [trackFinder]
 
+#
+# 4. track fitting
+#
 if runTrkFitter:
 
     # Track fitter using Genfit2, following example from
@@ -520,42 +585,69 @@ if runTrkFitter:
     )
     TopAlg += [trackFitter]
 
-# Calorimeter digitization (merging hits into cells, EM scale calibration via sampling fractions)
 
-# - ECAL readouts
-ecalBarrelReadoutName = "ECalBarrelModuleThetaMerged"      # barrel, original segmentation (baseline)
-ecalBarrelReadoutName2 = "ECalBarrelModuleThetaMerged2"    # barrel, after re-segmentation (for optimisation studies)
-ecalEndcapReadoutName = "ECalEndcapTurbine"                # endcap, turbine-like (baseline)
-# - HCAL readouts
-if runHCal:
-    hcalBarrelReadoutName = "HCalBarrelReadout"            # barrel, original segmentation (phi-theta)
-    # hcalBarrelReadoutName = "HCalBarrelReadoutPhiRow"    # barrel, alternative segmentation (phi-row)
-    hcalEndcapReadoutName = "HCalEndcapReadout"            # endcap, original segmentation
-else:
-    hcalBarrelReadoutName = ""
-    hcalEndcapReadoutName = ""
+#
+# Calorimeter sequence
+#
+
+#
+# 1. initial preparation
+#
+# retrieve number of ECAL barrel layers and check consistency with SFs
+ecalBarrelLayers = int(constants["ECalBarrelNumLayers"])
+print("Number of ECAL barrel layers", ecalBarrelLayers)
+if ecalBarrelSamplingFraction and len(ecalBarrelSamplingFraction) > 0:
+    assert (ecalBarrelLayers == len(ecalBarrelSamplingFraction))
+
+# retrieve number of EMEC wheels and layers and check consistency with SFs
+# the turbine endcap has calibration "layers" in the both the z and radial
+# directions, for each of the three wheels.  So the total number of layers
+# is given by the sum over each wheel of z*rho calib layers
+ecalEndcapWheels = int(constants["EMECnWheels"])
+print("Number of ECAL endcap wheels", ecalEndcapWheels)
+ecalEndcapLayers = 0
+for iWheel in range(ecalEndcapWheels):
+    ecalEndcapNumCalibZLayersWheel = int(constants[f"EMECNumCalibZLayersWheel{iWheel+1}"])
+    ecalEndcapNumCalibRhoLayersWheel = int(constants[f"EMECNumCalibRhoLayersWheel{iWheel+1}"])
+    ecalEndcapLayers += ecalEndcapNumCalibZLayersWheel*ecalEndcapNumCalibRhoLayersWheel
+if ecalEndcapSamplingFraction and len(ecalEndcapSamplingFraction) > 0:
+    assert (ecalEndcapLayers == len(ecalEndcapSamplingFraction))
+
+# HCAL parameters for digitization
+hcalBarrelLayers = 13
+hcalEndcapLayers = 22
+
+outputSaveClusters = []  # list of clusters for which we want to create the truth links
+
+#
+# 2. Calorimeter digitization (merging hits into cells, EM scale calibration via sampling fractions)
+#
 
 # - EM scale calibration (sampling fraction)
 from Configurables import CalibrateInLayersTool
-#   * ECAL barrel
-calibEcalBarrel = CalibrateInLayersTool("CalibrateECalBarrel",
-                                        samplingFraction=ecalBarrelSamplingFraction,
-                                        readoutName=ecalBarrelReadoutName,
-                                        layerFieldName="layer")
-#   * ECAL endcap
-calibEcalEndcap = CalibrateInLayersTool("CalibrateECalEndcap",
-                                        samplingFraction=ecalEndcapSamplingFraction,
-                                        readoutName=ecalEndcapReadoutName,
-                                        layerFieldName="layer")
+#   ECAL barrel
+calibEcalBarrel = CalibrateInLayersTool(
+    "CalibrateECalBarrel",
+    samplingFraction=ecalBarrelSamplingFraction,
+    readoutName=ecalBarrelReadoutName,
+    layerFieldName="layer")
+#   ECAL endcap
+calibEcalEndcap = CalibrateInLayersTool(
+    "CalibrateECalEndcap",
+    samplingFraction=ecalEndcapSamplingFraction,
+    readoutName=ecalEndcapReadoutName,
+    layerFieldName="layer")
 
 if runHCal:
     from Configurables import CalibrateCaloHitsTool
     # HCAL barrel
     calibHCalBarrel = CalibrateCaloHitsTool(
-        "CalibrateHCalBarrel", invSamplingFraction="29.4202")
+        "CalibrateHCalBarrel",
+        invSamplingFraction=f"{hcalInverseSamplingFraction}")
     # HCAL endcap
     calibHCalEndcap = CalibrateCaloHitsTool(
-        "CalibrateHCalEndcap", invSamplingFraction="29.4202")  # FIXME: to be updated for ddsim
+        "CalibrateHCalEndcap",
+        invSamplingFraction=f"{hcalInverseSamplingFraction}")
 
 # - cell positioning tools
 from Configurables import CellPositionsECalBarrelModuleThetaSegTool
@@ -609,16 +701,15 @@ if runHCal:
 if addCrosstalk:
     from Configurables import ReadCaloCrosstalkMap
     # read the crosstalk map
-    readCrosstalkMap = ReadCaloCrosstalkMap("ReadCrosstalkMap",
-                                            fileName="https://fccsw.web.cern.ch/fccsw/filesForSimDigiReco/ALLEGRO/ALLEGRO_o1_v03/xtalk_neighbours_map_ecalB_thetamodulemerged.root",
-                                            OutputLevel=INFO)
+    readCrosstalkMap = ReadCaloCrosstalkMap(
+        "ReadCrosstalkMap",
+        fileName="https://fccsw.web.cern.ch/fccsw/filesForSimDigiReco/ALLEGRO/ALLEGRO_o1_v03/xtalk_neighbours_map_ecalB_thetamodulemerged.root",
+        OutputLevel=INFO)
 else:
     readCrosstalkMap = None
 
 # - noise tool
 if addNoise:
-    ecalBarrelNoisePath = dataFolder + "elecNoise_ecalBarrelFCCee_theta.root"
-    ecalBarrelNoiseRMSHistName = "h_elecNoise_fcc_"
     from Configurables import NoiseCaloCellsFromFileBarrelTool
     ecalBarrelNoiseTool = NoiseCaloCellsFromFileBarrelTool(
         "ecalBarrelNoiseTool",
@@ -646,8 +737,6 @@ if addNoise:
                                                           fieldValues=[IDs["ECAL_Barrel"]],
                                                           OutputLevel=INFO)
 
-    ecalEndcapNoisePath = dataFolder + "elecNoise_ecalendcap.root"
-    ecalEndcapNoiseRMSHistName = "noise_endcap_wheel"
     from Configurables import NoiseCaloCellsFromFileTurbineEndcapTool
     ecalEndcapNoiseTool = NoiseCaloCellsFromFileTurbineEndcapTool("ecalEndcapNoiseTool",
                                                                   cellPositionsTool=cellPositionEcalEndcapToolForNoise,
@@ -1017,7 +1106,7 @@ def setupSWClusters(inputCells,
                                                       nThetaFinal=finT, nPhiFinal=finP,
                                                       energyThreshold=threshold,
                                                       energySharingCorrection=False,
-                                                      createClusterCellCollection=doCreateClusterCellCollection,
+                                                      createClusterCellCollection=saveClusterCells,
                                                       OutputLevel=INFO
                                                       )
     clusterAlg.clusters.Path = outputClusters
@@ -1206,7 +1295,7 @@ def setupTopoClusters(inputCells,
                                       lastNeighbourSigma=lastNeighbourSigma,
                                       minClusterEnergy=clusteringThreshold,
                                       calorimeterIDs=caloIDs,
-                                      createClusterCellCollection=doCreateClusterCellCollection,
+                                      createClusterCellCollection=saveClusterCells,
                                       OutputLevel=INFO)
     TopAlg += [clusterAlg]
     outputSaveClusters.append(outputClusters)
